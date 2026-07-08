@@ -2347,6 +2347,9 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    profile: Optional[str] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -2426,6 +2429,15 @@ def delegate_task(
         creds = _resolve_delegation_credentials(cfg, parent_agent)
     except ValueError as exc:
         return tool_error(str(exc))
+
+    # Per-call model/provider/profile override
+    if model:
+        per_call_creds = _resolve_per_call_credentials(
+            model=model,
+            provider=provider,
+            profile=profile,
+        )
+        creds = per_call_creds
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -3137,6 +3149,69 @@ def _load_config() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Per-call credential resolution (model/provider/profile overrides)
+# ---------------------------------------------------------------------------
+def _resolve_per_call_credentials(
+    model: str,
+    provider: Optional[str] = None,
+    profile: Optional[str] = None,
+) -> dict:
+    """Resolve credentials for a per-call model/provider override.
+
+    When provider is set, resolves the full credential bundle via Hermes'
+    runtime provider resolution (same path as CLI/gateway startup). This
+    handles ALL officially supported providers without maintaining a
+    separate keymap.
+
+    When provider is None, returns the model override only — the child
+    inherits the parent agent's default provider/credentials.
+
+    When profile is set, temporarily switches the active profile for
+    credential resolution.
+
+    Returns a dict: {model, provider, base_url, api_key, api_mode}
+    """
+    if not provider:
+        # No provider override — return model only, child inherits parent creds
+        return {
+            "model": model,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+
+    # Delegate to Hermes' canonical runtime provider resolution.
+    # This handles ALL officially supported providers via the same path
+    # the CLI and gateway use — no manual keymap to maintain.
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(requested=provider, target_model=model)
+    except Exception as exc:
+        raise ValueError(
+            f"Cannot resolve per-call provider '{provider}': {exc}. "
+            f"Check that the provider is configured (run 'hermes auth'), "
+            f"or omit the provider parameter to inherit from the parent session."
+        ) from exc
+
+    api_key = runtime.get("api_key", "")
+    if not api_key:
+        raise ValueError(
+            f"Provider '{provider}' resolved but has no API key. "
+            f"Run 'hermes auth {provider}' or set the appropriate environment variable."
+        )
+
+    return {
+        "model": model,
+        "provider": provider,
+        "base_url": runtime.get("base_url"),
+        "api_key": api_key,
+        "api_mode": runtime.get("api_mode"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # OpenAI Function-Calling Schema
 # ---------------------------------------------------------------------------
 
@@ -3380,6 +3455,36 @@ DELEGATE_TASK_SCHEMA = {
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
             },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Override the subagent model (e.g. 'claude-sonnet-4') "
+                    "for this particular delegation. When set, the child uses "
+                    "this model instead of inheriting the parent's model. "
+                    "If 'provider' is also set, the provider's configured "
+                    "default for this model is used; otherwise the parent's "
+                    "current provider is kept."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Override the subagent provider (e.g. 'anthropic', "
+                    "'openrouter') for this particular delegation. Resolved via "
+                    "Hermes' canonical runtime provider resolution — supports "
+                    "all officially configured providers. Only honored when "
+                    "'model' is also set."
+                ),
+            },
+            "profile": {
+                "type": "string",
+                "description": (
+                    "Override the Hermes profile for credential resolution. "
+                    "Reads the profile's config.yaml and .env for the "
+                    "specified provider. Only honored when 'model' and "
+                    "'provider' are also set."
+                ),
+            },
             "background": {
                 "type": "boolean",
                 "description": (
@@ -3447,6 +3552,9 @@ registry.register(
     handler=lambda args, **kw: delegate_task(
         goal=args.get("goal"),
         context=args.get("context"),
+        model=args.get("model"),
+        provider=args.get("provider"),
+        profile=args.get("profile"),
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
